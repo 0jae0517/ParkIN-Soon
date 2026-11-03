@@ -265,7 +265,8 @@ class ParkinsonRAG:
             f"  * Q6(대변 안간힘): {scopa_details[1] if len(scopa_details) > 1 else '미검사'}점\n"
             f"  * Q7(변지림): {scopa_details[2] if len(scopa_details) > 2 else '미검사'}점\n"
             f"- 나선 그리기 이미지 위험 확률: {pct_or_pending(p_img)}\n"
-            f"- 나선 그리기 속도/떨림(운동학) 위험 확률: {pct_or_pending(p_kin)}\n"
+            f"- 나선 그리기 속도/떨림(운동학) 위험 확률: "
+            f"{('측정 불가(종합 판정에서 제외)' if p_kin is None and final_risk is not None else pct_or_pending(p_kin))}\n"
         )
 
         # 시스템 프롬프트 구성

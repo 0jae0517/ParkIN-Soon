@@ -87,12 +87,16 @@ T_KIN = 0.5418
 def fuse_scores(weights, p_olf, p_img, p_kin):
     """AUC 가중 Late Fusion.
     모델마다 확률 스케일·임계값이 달라 확률만 평균내면 왜곡되므로,
-    같은 가중치로 임계값도 합성해 '융합 점수 vs 융합 임계값'으로 비교한다."""
-    w = {k: float(weights[k]) for k in ("olf", "img", "kin")}
+    같은 가중치로 임계값도 합성해 '융합 점수 vs 융합 임계값'으로 비교한다.
+    측정에 실패한 모달(None)은 제외하고, 남은 모달의 가중치만 다시 정규화한다."""
+    probs = {"olf": p_olf, "img": p_img, "kin": p_kin}
+    thrs = {"olf": T_OLF, "img": T_IMG, "kin": T_KIN}
+    used = [k for k, v in probs.items() if v is not None]
+    w = {k: float(weights[k]) for k in used}
     total = sum(w.values())
     w = {k: v / total for k, v in w.items()}
-    fused = w["olf"] * p_olf + w["img"] * p_img + w["kin"] * p_kin
-    t_fused = w["olf"] * T_OLF + w["img"] * T_IMG + w["kin"] * T_KIN
+    fused = sum(w[k] * probs[k] for k in used)
+    t_fused = sum(w[k] * thrs[k] for k in used)
     return fused, t_fused
 NORMAL_OLF_PCT = 90.0
 NORMAL_BOWEL_SCORE = 1.0
@@ -457,6 +461,8 @@ def red_text(text):
     return f"<span style='color:{C_RED};font-weight:900;'>{text}</span>"
 
 def percent_badge(value):
+    if value is None:
+        return red_text("측정 불가")
     return red_text(f"{value * 100:.1f}%")
 
 def emphasize_symptoms(text):
@@ -574,7 +580,11 @@ def render_previous_comparison(previous_row, *, olf_score, con_score, p_olf, p_i
         trend_text(con_score, previous_row.get("scopa_score"), lower_is_better=True, unit="점"),
         trend_text(p_olf * 100, (previous_row.get("p_olf") or 0) * 100, lower_is_better=True, unit="%p"),
         trend_text(p_img * 100, (previous_row.get("p_img") or 0) * 100, lower_is_better=True, unit="%p"),
-        trend_text(p_kin * 100, (previous_row.get("p_kin") or 0) * 100, lower_is_better=True, unit="%p"),
+        trend_text(
+            None if p_kin is None else p_kin * 100,
+            None if previous_row.get("p_kin") is None else previous_row.get("p_kin") * 100,
+            lower_is_better=True, unit="%p",
+        ),
     ]
     body = (
         f"{report_label('이전 검사일')} {prev_dt}<br>"
@@ -835,12 +845,19 @@ def extract_kin(x, y, t):
     return feats
 
 def get_kin_feats(cj):
+    """운동학 특성 12개. 좌표가 부족하거나 계산에 실패하면 None을 반환한다.
+    (임의값을 넣으면 측정 실패가 정상 결과처럼 보이므로 '측정 불가'로 처리)"""
     try:
         x, y, t = cj.get("x", []), cj.get("y", []), cj.get("t", [])
-        if len(x) < 10: return [0.5] * len(FEATURE_COLS)
+        if len(x) < 10:
+            return None
         f = extract_kin(x, y, t)
-        return [f[c] for c in FEATURE_COLS]
-    except: return [0.5] * len(FEATURE_COLS)
+        feats = [f[c] for c in FEATURE_COLS]
+        if not all(np.isfinite(feats)):
+            return None
+        return feats
+    except Exception:
+        return None
 
 def make_saliency(img_array, model):
     """입력 픽셀에 대한 예측값 기울기(saliency map). Grad-CAM이 아님."""
@@ -938,8 +955,11 @@ def bowel_local_comment(score):
     )
 
 def drawing_local_comment(p_img, p_kin, shape_comment, kin_comment):
-    if p_img >= T_IMG or p_kin >= T_KIN:
-        color = C_ORANGE if not (p_img >= T_IMG and p_kin >= T_KIN) else C_RED
+    kin_high = p_kin is not None and p_kin >= T_KIN
+    if p_kin is None:
+        kin_comment = "손 움직임은 측정되지 않아 이번 결과에서 제외했습니다."
+    if p_img >= T_IMG or kin_high:
+        color = C_ORANGE if not (p_img >= T_IMG and kin_high) else C_RED
         body = (
             "AI가 그림의 선 모양과 움직임을 함께 살펴봤습니다.<br>"
             "색이 진한 부분은 AI가 중요하게 본 부분입니다.<br>"
@@ -952,7 +972,8 @@ def drawing_local_comment(p_img, p_kin, shape_comment, kin_comment):
             "AI가 그림의 선 모양과 움직임을 함께 살펴봤습니다.<br>"
             "색이 진한 부분은 AI가 중요하게 본 부분입니다.<br>"
             "이번 손그림 결과에서는 큰 이상 신호가 뚜렷하지 않습니다.<br>"
-            "다만 이 검사는 진단이 아니라 참고용입니다."
+            + (f"{kin_comment}<br>" if p_kin is None else "")
+            + "다만 이 검사는 진단이 아니라 참고용입니다."
         )
     return color, body
 
@@ -968,7 +989,9 @@ def final_local_comment(level, olf_score, con_score, p_olf, p_img, p_kin):
     drawing_notes = []
     if p_img >= T_IMG:
         drawing_notes.append("나선 그림의 모양에서 선의 흔들림이나 불규칙함이 보일 수 있습니다")
-    if p_kin >= T_KIN:
+    if p_kin is None:
+        drawing_notes.append("손 움직임은 측정되지 않아 판정에서 제외했습니다")
+    elif p_kin >= T_KIN:
         drawing_notes.append("손의 움직임 속도 변화나 떨림 신호가 보일 수 있습니다")
     if not drawing_notes:
         drawing_notes.append("손그림 항목에서는 큰 이상 신호가 뚜렷하지 않습니다")
@@ -977,10 +1000,10 @@ def final_local_comment(level, olf_score, con_score, p_olf, p_img, p_kin):
         color = C_GREEN
         body = (
             f"{report_label('위험도 점수')} 낮음<br>"
-            f"{report_label('설명')} 세 가지 검사에서 큰 주의 신호는 뚜렷하지 않습니다.<br>"
+            f"{report_label('설명')} 측정된 검사에서 큰 주의 신호는 뚜렷하지 않습니다.<br>"
             f"{report_label('모델 점수')} 후각+배변 {percent_badge(p_olf)}, 그림 모양 {percent_badge(p_img)}, 손 움직임 {percent_badge(p_kin)}입니다.<br>"
             f"{report_label('검사 결과')} 후각은 {olf_score}/12점, 배변 불편 점수는 {con_score}/9점입니다.<br>"
-            f"{report_label('증상')} {olf_bowel_note[0]}. {drawing_notes[0]}.<br>"
+            f"{report_label('증상')} {olf_bowel_note[0]}. {' / '.join(drawing_notes)}.<br>"
             f"{report_label('예시 증상')} 냄새 저하, 변비, 손 떨림이 새로 생기는지 살펴보세요.<br>"
             f"{report_label('다음 행동')} 평소와 다른 증상이 생기면 의료진과 상담해 주세요."
         )
@@ -1116,14 +1139,18 @@ elif st.session_state.step == 1:
     <div style="background:#f3f0ee;border-radius:12px;padding:24px 0;font-size:34px;margin-bottom:12px;">{icon}</div>
             <div style="font-size:23px;font-weight:900;color:{C_DARK};">{lbl}</div>
 </div>""", unsafe_allow_html=True)
-                ans = st.radio("구별?", ["○ 구별됨", "✗ 모르겠음"], horizontal=True,
+                ans = st.radio("구별?", ["○ 구별됨", "✗ 모르겠음"], horizontal=True, index=None,
                                key=f"olf_{keys[ki]}", label_visibility="collapsed")
-                temp.append(1 if "○" in ans else 0)
+                temp.append(None if ans is None else (1 if "○" in ans else 0))
 
     st.markdown("<div style='margin-top:20px'></div>", unsafe_allow_html=True)
     if st.button("다음 단계 →  배변 상태 체크", use_container_width=True, type="primary"):
-        st.session_state.olf_results = temp
-        st.session_state.step = 2; rerun()
+        missing = [bsit[k][0] for k, v in zip(keys, temp) if v is None]
+        if missing:
+            st.warning(f"아직 답하지 않은 향이 {len(missing)}개 있습니다: {', '.join(missing)}")
+        else:
+            st.session_state.olf_results = temp
+            st.session_state.step = 2; rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 2: 배변
@@ -1158,14 +1185,17 @@ elif st.session_state.step == 2:
         </div>
     </div>
 </div>""", unsafe_allow_html=True)
-        val = st.radio("점수", [0, 1, 2, 3], format_func=lambda x: so[x],
+        val = st.radio("점수", [0, 1, 2, 3], format_func=lambda x: so[x], index=None,
                        horizontal=True, key=key, label_visibility="collapsed")
         res.append(val)
 
     st.markdown("<div style='margin-top:20px'></div>", unsafe_allow_html=True)
     if st.button("다음 단계 →  나선 그리기", use_container_width=True, type="primary"):
-        st.session_state.scopa_results = res
-        st.session_state.step = 3; rerun()
+        if any(v is None for v in res):
+            st.warning("아직 답하지 않은 문항이 있습니다. 모든 문항에 답해주세요.")
+        else:
+            st.session_state.scopa_results = res
+            st.session_state.step = 3; rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 3: 손그림
@@ -1232,9 +1262,11 @@ elif st.session_state.step == 4:
     if st.session_state.canvas_img is None:
         st.error("손그림 이미지가 없습니다. 처음부터 다시 진행해주세요."); st.stop()
     p_img = float(np.asarray(m_img.predict(preprocess_canvas(st.session_state.canvas_img), verbose=0)).ravel()[0])
-    p_kin = pred_proba(m_kin, get_kin_feats(st.session_state.get("canvas_json", {})))
+    kin_input = get_kin_feats(st.session_state.get("canvas_json", {}))
+    p_kin = pred_proba(m_kin, kin_input) if kin_input is not None else None  # None = 측정 불가
+    n_measured = 3 if p_kin is not None else 2
 
-    cnt = int(p_olf >= T_OLF) + int(p_img >= T_IMG) + int(p_kin >= T_KIN)
+    cnt = int(p_olf >= T_OLF) + int(p_img >= T_IMG) + int(p_kin is not None and p_kin >= T_KIN)
     fused, t_fused = fuse_scores(weights, p_olf, p_img, p_kin)
     # 판정: 이상 항목 없음 → low / 이상 항목은 있으나 융합 점수 < 융합 임계값 → mid / 융합 점수 ≥ 융합 임계값 → high
     # (cnt == 0 이면 fused < t_fused 가 항상 성립하고, fused ≥ t_fused 이면 cnt ≥ 1 이 항상 성립)
@@ -1249,7 +1281,8 @@ elif st.session_state.step == 4:
     if level == "low":
         ri = "✅"; rc = C_GREEN; rb = "#f0fdf4"; rbd = "#86efac"; rl = "low"
         rt = "특이 징후가 발견되지 않았습니다"
-        rs = "세 가지 검사 항목 모두 정상 범위 이내입니다."
+        rs = ("세 가지 검사 항목 모두 정상 범위 이내입니다." if n_measured == 3
+              else "측정된 두 가지 검사 항목은 정상 범위 이내입니다. (손 움직임은 측정되지 않았습니다)")
         ra = "정기적인 건강 검진을 꾸준히 받으시길 권장드립니다."
     elif level == "mid":
         ri = "⚠️"; rc = C_ORANGE; rb = "#fff7ed"; rbd = "#fed7aa"; rl = "mid"
@@ -1422,7 +1455,9 @@ elif st.session_state.step == 4:
         
         # ── 운동학 수치 ───────────────────────────────────────────────────────
         kin_feats = get_kin_feats(st.session_state.get("canvas_json", {}))
-        if kin_feats and any(v != 0.5 for v in kin_feats):
+        if kin_feats is None:
+            st.warning("손 움직임 수치를 계산하지 못했습니다. (그린 선이 너무 짧거나 기록이 부족합니다) 이 항목은 종합 판정에서 제외했습니다.")
+        else:
             feat_dict = dict(zip(FEATURE_COLS, kin_feats))
             st.markdown(f"""
 <div style="background:#f8fafc;border-radius:12px;padding:16px 20px;margin-top:12px;">
@@ -1608,8 +1643,8 @@ elif st.session_state.step == 4:
         </div>
         <div style="background:white;border:1.5px solid #dbeafe;border-radius:14px;padding:16px;">
             <div style="font-size:18px;color:#64748b;margin-bottom:6px;">3. 손 움직임</div>
-            <div style="font-size:28px;font-weight:900;color:{signal_color(p_kin, T_KIN)};">{p_kin * 100:.1f}%</div>
-            <div style="font-size:17px;color:#475569;margin-top:8px;">이상 감지 {cnt}/3</div>
+            <div style="font-size:28px;font-weight:900;color:{signal_color(p_kin, T_KIN)};">{format_model_signal(p_kin) if p_kin is not None else "측정 불가"}</div>
+            <div style="font-size:17px;color:#475569;margin-top:8px;">이상 감지 {cnt}/{n_measured}</div>
         </div>
     </div>
     <div style="font-size:17px;color:#64748b;margin-top:12px;">
@@ -1657,7 +1692,9 @@ elif st.session_state.step == 4:
 
         kin_feats_report = get_kin_feats(st.session_state.get("canvas_json", {}))
         kin_comment_report = "움직임 수치는 충분히 계산되지 않았습니다."
-        if kin_feats_report and any(v != 0.5 for v in kin_feats_report):
+        if kin_feats_report is None:
+            kin_comment_report = "손 움직임은 측정되지 않아 종합 판정에서 제외했습니다."
+        else:
             feat_report = dict(zip(FEATURE_COLS, kin_feats_report))
             vel_cv = feat_report["velocity_cv"]
             vel_mean = feat_report["velocity_mean"]
