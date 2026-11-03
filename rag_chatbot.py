@@ -1,4 +1,5 @@
 import os
+import re
 import argparse
 import pickle
 import numpy as np
@@ -15,6 +16,11 @@ DEFAULT_MODEL_DIR = APP_DIR / "modeling"
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", DEFAULT_MODEL_DIR)).expanduser().resolve()
 PAPERS_DIR = APP_DIR / "LLM논문"
 DB_PATH = MODEL_DIR / "vector_db.pkl"
+
+# 불안 표현 감지: 단순 부분 문자열("죽", "어떻게 되는")은 "죽염", "결과가 어떻게 되는 건가요?" 같은
+# 일반 질문까지 막으므로, 불안을 드러내는 활용형만 매칭합니다.
+# "위험한가요?" 같은 결과 해석 질문은 차단하지 않고 LLM이 답하도록 둡니다.
+ANXIETY_PATTERN = re.compile(r"죽(을|는|나|어|게|기|었|겠)|큰일|무서|겁(이|나)|오래 ?살|살 수 있을까")
 
 _embedder_instance = None
 
@@ -202,8 +208,7 @@ class ParkinsonRAG:
 
     def generate_rag_answer(self, query: str, test_results: Dict[str, Any], top_k: int = 3) -> str:
         """논문 근거 및 검사 결과에 기반하여 답변을 생성합니다."""
-        anxiety_terms = ["죽", "큰일", "어떻게 되는", "무서", "위험한가", "위험해", "살 수"]
-        if any(term in query for term in anxiety_terms):
+        if ANXIETY_PATTERN.search(query):
             return (
                 "아니요. 이 검사 결과만 보고 “곧 죽는다”거나 “큰일 났다”고 말할 수는 없습니다.\n\n"
                 "이 검사는 병을 확정하는 검사가 아닙니다. "
@@ -248,9 +253,11 @@ class ParkinsonRAG:
         p_img = test_results.get("p_img")
         p_kin = test_results.get("p_kin")
         final_risk = test_results.get("final_risk")
+        final_thr = test_results.get("final_risk_threshold")
 
         results_str = (
-            f"- 종합 파킨슨 위험도: {pct_or_pending(final_risk)}\n"
+            f"- 종합 점수(세 검사 AUC 가중 융합, 진단 확률 아님): {pct_or_pending(final_risk)}"
+            f" (주의 기준 {pct_or_pending(final_thr)})\n"
             f"- 후각 인지 점수: {olf_score} / 12\n"
             f"- 배변 불편 점수: {scopa_score} / 9 (높을수록 불편이 큼)\n"
             f"- 후각+배변 모델 주의 신호: {pct_or_pending(p_olf)}\n"
@@ -272,7 +279,7 @@ class ParkinsonRAG:
             "3. 사용자가 불안해하지 않도록 단정적인 진단 표현을 피합니다.\n"
             "4. “파킨슨병입니다”라고 말하지 않습니다. “주의가 필요한 신호가 보입니다”처럼 설명합니다.\n"
             "5. 검사 결과는 참고용입니다. 정확한 진단은 신경과 전문의 상담이 필요하다고 안내합니다.\n"
-            "6. Grad-CAM은 “AI가 그림에서 중요하게 본 부분을 색으로 표시한 것”이라고 설명합니다.\n"
+            "6. 손그림의 AI 주목 영역(saliency map)은 “AI가 그림에서 중요하게 본 부분을 색으로 표시한 것”이라고 설명합니다.\n"
             "7. 고위험, 중위험, 저위험 결과에 따라 다음 행동을 쉽게 안내합니다.\n"
             "8. 보호자나 보건소 담당자에게 보여줄 수 있는 요약도 함께 제공합니다.\n\n"
             "금지 표현:\n"

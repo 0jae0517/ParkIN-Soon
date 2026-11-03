@@ -82,6 +82,18 @@ IMAGE_MODEL_SIZE   = (224, 224)
 T_OLF = 0.4617
 T_IMG = 0.4510
 T_KIN = 0.5418
+
+
+def fuse_scores(weights, p_olf, p_img, p_kin):
+    """AUC 가중 Late Fusion.
+    모델마다 확률 스케일·임계값이 달라 확률만 평균내면 왜곡되므로,
+    같은 가중치로 임계값도 합성해 '융합 점수 vs 융합 임계값'으로 비교한다."""
+    w = {k: float(weights[k]) for k in ("olf", "img", "kin")}
+    total = sum(w.values())
+    w = {k: v / total for k, v in w.items()}
+    fused = w["olf"] * p_olf + w["img"] * p_img + w["kin"] * p_kin
+    t_fused = w["olf"] * T_OLF + w["img"] * T_IMG + w["kin"] * T_KIN
+    return fused, t_fused
 NORMAL_OLF_PCT = 90.0
 NORMAL_BOWEL_SCORE = 1.0
 
@@ -830,7 +842,8 @@ def get_kin_feats(cj):
         return [f[c] for c in FEATURE_COLS]
     except: return [0.5] * len(FEATURE_COLS)
 
-def make_gradcam(img_array, model):
+def make_saliency(img_array, model):
+    """입력 픽셀에 대한 예측값 기울기(saliency map). Grad-CAM이 아님."""
     img_var = tf.Variable(img_array.astype(np.float32))
     with tf.GradientTape() as tape:
         preds = model(img_var, training=False)
@@ -943,7 +956,7 @@ def drawing_local_comment(p_img, p_kin, shape_comment, kin_comment):
         )
     return color, body
 
-def final_local_comment(cnt, olf_score, con_score, p_olf, p_img, p_kin):
+def final_local_comment(level, olf_score, con_score, p_olf, p_img, p_kin):
     olf_bowel_note = []
     if olf_score < 9:
         olf_bowel_note.append("냄새를 구별하는 힘이 낮아진 신호가 있을 수 있습니다")
@@ -960,7 +973,7 @@ def final_local_comment(cnt, olf_score, con_score, p_olf, p_img, p_kin):
     if not drawing_notes:
         drawing_notes.append("손그림 항목에서는 큰 이상 신호가 뚜렷하지 않습니다")
 
-    if cnt == 0:
+    if level == "low":
         color = C_GREEN
         body = (
             f"{report_label('위험도 점수')} 낮음<br>"
@@ -971,11 +984,11 @@ def final_local_comment(cnt, olf_score, con_score, p_olf, p_img, p_kin):
             f"{report_label('예시 증상')} 냄새 저하, 변비, 손 떨림이 새로 생기는지 살펴보세요.<br>"
             f"{report_label('다음 행동')} 평소와 다른 증상이 생기면 의료진과 상담해 주세요."
         )
-    elif cnt == 1:
+    elif level == "mid":
         color = C_ORANGE
         body = (
             f"{report_label('위험도 점수')} 중간<br>"
-            f"{report_label('설명')} 검사 중 한 항목에서 주의 신호가 보입니다.<br>"
+            f"{report_label('설명')} 일부 항목에서 주의 신호가 보이지만, 세 검사를 종합한 점수는 기준 아래입니다.<br>"
             f"{report_label('모델 점수')} 후각+배변 {percent_badge(p_olf)}, 그림 모양 {percent_badge(p_img)}, 손 움직임 {percent_badge(p_kin)}입니다.<br>"
             f"{report_label('증상')} {' / '.join(olf_bowel_note)}. {' / '.join(drawing_notes)}.<br>"
             f"{report_label('예시 증상')} 냄새가 둔해짐, 변비가 이어짐, 선이 흔들림, 손 움직임이 느려짐이 있을 수 있습니다.<br>"
@@ -985,7 +998,7 @@ def final_local_comment(cnt, olf_score, con_score, p_olf, p_img, p_kin):
         color = C_RED
         body = (
             f"{report_label('위험도 점수')} 높음<br>"
-            f"{report_label('설명')} 여러 항목에서 주의가 필요한 신호가 함께 보입니다.<br>"
+            f"{report_label('설명')} 세 검사를 종합한 점수가 기준을 넘어, 주의가 필요한 신호가 보입니다.<br>"
             f"{report_label('모델 점수')} 후각+배변 {percent_badge(p_olf)}, 그림 모양 {percent_badge(p_img)}, 손 움직임 {percent_badge(p_kin)}입니다.<br>"
             f"{report_label('증상')} {' / '.join(olf_bowel_note)}. {' / '.join(drawing_notes)}.<br>"
             f"{report_label('예시 증상')} 냄새를 잘 못 맡음, 변비가 오래감, 대변을 볼 때 힘을 많이 줌, 손이 떨림, 글씨나 선이 불규칙해짐이 있을 수 있습니다.<br>"
@@ -1222,22 +1235,31 @@ elif st.session_state.step == 4:
     p_kin = pred_proba(m_kin, get_kin_feats(st.session_state.get("canvas_json", {})))
 
     cnt = int(p_olf >= T_OLF) + int(p_img >= T_IMG) + int(p_kin >= T_KIN)
+    fused, t_fused = fuse_scores(weights, p_olf, p_img, p_kin)
+    # 판정: 이상 항목 없음 → low / 이상 항목은 있으나 융합 점수 < 융합 임계값 → mid / 융합 점수 ≥ 융합 임계값 → high
+    # (cnt == 0 이면 fused < t_fused 가 항상 성립하고, fused ≥ t_fused 이면 cnt ≥ 1 이 항상 성립)
+    if cnt == 0:
+        level = "low"
+    elif fused < t_fused:
+        level = "mid"
+    else:
+        level = "high"
 
     # ── 종합 결과 변수 ────────────────────────────────────────────────────────
-    if cnt == 0:
+    if level == "low":
         ri = "✅"; rc = C_GREEN; rb = "#f0fdf4"; rbd = "#86efac"; rl = "low"
         rt = "특이 징후가 발견되지 않았습니다"
         rs = "세 가지 검사 항목 모두 정상 범위 이내입니다."
         ra = "정기적인 건강 검진을 꾸준히 받으시길 권장드립니다."
-    elif cnt == 1:
+    elif level == "mid":
         ri = "⚠️"; rc = C_ORANGE; rb = "#fff7ed"; rbd = "#fed7aa"; rl = "mid"
         rt = "일부 항목에서 주의가 필요합니다"
-        rs = "한 가지 검사 항목에서 이상 징후가 감지되었습니다."
+        rs = f"{cnt}가지 검사 항목에서 이상 징후가 감지되었으나, 종합 점수는 기준 미만입니다."
         ra = "전문의와 상담해 보시는 것을 권장드립니다."
     else:
         ri = "🔴"; rc = C_RED; rb = "#fef2f2"; rbd = "#fca5a5"; rl = "high"
-        rt = "복수의 항목에서 이상 징후가 감지되었습니다"
-        rs = f"{cnt}가지 검사 항목에서 동시에 이상 징후가 확인되었습니다."
+        rt = "종합 점수에서 이상 징후가 감지되었습니다"
+        rs = f"{cnt}가지 검사 항목에서 이상 징후가 확인되었고, 세 검사를 종합한 점수도 기준을 넘었습니다."
         ra = "전문의의 소견을 받아보시길 권장드립니다."
 
     if not st.session_state.get("result_saved", False):
@@ -1345,11 +1367,11 @@ elif st.session_state.step == 4:
                 st.session_state.result_page = 2; rerun()
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 결과 Page 2: 손그림 Grad-CAM + 운동학
+    # 결과 Page 2: 손그림 saliency map + 운동학
     # ══════════════════════════════════════════════════════════════════════════
     elif st.session_state.result_page == 2:
 
-        # ── 손그림 Grad-CAM ───────────────────────────────────────────────────
+        # ── 손그림 saliency map ───────────────────────────────────────────────────
         st.markdown(f"""
 <div style="background:white;border:1.5px solid #fce7f3;border-radius:18px;
             padding:28px 28px;margin-bottom:20px;">
@@ -1359,15 +1381,15 @@ elif st.session_state.step == 4:
 
         img_input = preprocess_canvas(st.session_state.canvas_img)
         try:
-            gradcam_img = make_gradcam(img_input, m_img)
+            saliency_img = make_saliency(img_input, m_img)
             col_orig, col_cam = st.columns(2)
             with col_orig:
                 st.markdown("**원본 나선 그림**")
                 orig_np = (img_input[0] * 255).astype(np.uint8)
                 st.image(orig_np, width=350)
             with col_cam:
-                st.markdown("**AI 주목 영역 (Grad-CAM)**")
-                st.image(gradcam_img[:, :, ::-1], width=350)
+                st.markdown("**AI 주목 영역 (Saliency Map)**")
+                st.image(saliency_img[:, :, ::-1], width=350)
 
             badge_img = "⚠️ 이상 감지" if p_img >= T_IMG else "✅ 정상 범위"
             color_img = C_RED if p_img >= T_IMG else C_GREEN
@@ -1378,7 +1400,7 @@ elif st.session_state.step == 4:
     border-radius:12px;padding:3px 10px;font-size:20px;">{badge_img}</span>
 </p>""", unsafe_allow_html=True)
         except Exception as e:
-            st.warning(f"Grad-CAM 생성 실패: {e}")
+            st.warning(f"주목 영역 시각화 생성 실패: {e}")
             
         if p_img < T_IMG * 0.6:
             shape_comment = "나선 형태가 전반적으로 안정적이며 이상 패턴이 관찰되지 않았습니다."
@@ -1624,14 +1646,14 @@ elif st.session_state.step == 4:
         st.markdown("## 3. 손그림 결과")
         img_input = preprocess_canvas(st.session_state.canvas_img)
         try:
-            gradcam_img = make_gradcam(img_input, m_img)
+            saliency_img = make_saliency(img_input, m_img)
             st.markdown("**원본 나선 그림**")
             st.image((img_input[0] * 255).astype(np.uint8), width=360)
             st.markdown("**AI가 중요하게 본 부분**")
-            st.image(gradcam_img[:, :, ::-1], width=360)
+            st.image(saliency_img[:, :, ::-1], width=360)
             st.caption("색이 진한 부분은 AI가 그림에서 중요하게 본 부분입니다.")
         except Exception as e:
-            st.warning(f"Grad-CAM 생성 실패: {e}")
+            st.warning(f"주목 영역 시각화 생성 실패: {e}")
 
         kin_feats_report = get_kin_feats(st.session_state.get("canvas_json", {}))
         kin_comment_report = "움직임 수치는 충분히 계산되지 않았습니다."
@@ -1677,7 +1699,7 @@ elif st.session_state.step == 4:
     <div style="font-size:20px;color:#475569;line-height:1.7;">{rs}<br>{ra}</div>
 </div>""", unsafe_allow_html=True)
 
-        final_color, final_body = final_local_comment(cnt, olf_score, con_score, p_olf, p_img, p_kin)
+        final_color, final_body = final_local_comment(level, olf_score, con_score, p_olf, p_img, p_kin)
         local_comment_card("박인순의 최종 코멘트", final_body, final_color)
         previous_result = get_previous_customer_result(
             st.session_state.get("customer_name", ""),
@@ -1718,6 +1740,7 @@ tr = {
     "p_kin": locals().get('p_kin', None),
     "kin_feats": locals().get('kin_feats', None),
     "result_page": st.session_state.get("result_page", 1),
-    "final_risk": (locals().get('cnt', 0) / 3.0) if st.session_state.get("step") == 4 else None
+    "final_risk": locals().get('fused', None) if st.session_state.get("step") == 4 else None,
+    "final_risk_threshold": locals().get('t_fused', None) if st.session_state.get("step") == 4 else None
 }
 ParkinsoonAI.render_parkinson_chatbot(tr)
